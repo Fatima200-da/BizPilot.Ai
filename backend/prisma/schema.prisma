@@ -1,0 +1,1203 @@
+// =============================================================================
+// BizPilot AI — Core Platform Database Schema
+// =============================================================================
+// Scope: Identity & Access, Tenancy, Billing & Subscriptions, AI Platform,
+// Content & Knowledge (Projects/Files/Prompts/Templates), Collaboration &
+// Governance (Notifications/Audit/Activity), and Extensibility (API/Webhooks).
+//
+// Domain modules (Sales CRM, Support Helpdesk, Marketing Campaigns, Analytics
+// warehouse) are deliberately out of scope for this schema — see "Bounded
+// Contexts & Future Microservices" in the accompanying architecture doc.
+// They will get their own schemas/databases, joined to this one only via
+// `workspaceId` (and the polymorphic `relatedEntityType`/`relatedEntityId`
+// pattern used by AIUsage/Notification/Activity/AuditLog).
+// =============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgcrypto]
+}
+
+// =============================================================================
+// SECTION 1 — Identity & Access
+// =============================================================================
+
+model User {
+  id              String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email           String    @unique
+  emailVerifiedAt DateTime?
+  passwordHash    String? // null for SSO-only accounts
+  fullName        String
+  avatarUrl       String?
+  phone           String?
+  timezone        String    @default("UTC")
+  locale          String    @default("en")
+  isSystemAdmin   Boolean   @default(false) // internal BizPilot staff, not a workspace role
+  lastLoginAt     DateTime?
+  deletedAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  sessions                Session[]
+  ownedWorkspaces         Workspace[]              @relation("WorkspaceOwner")
+  workspaceMemberships    WorkspaceMember[]        @relation("WorkspaceMemberUser")
+  invitedWorkspaceMembers WorkspaceMember[]        @relation("WorkspaceMemberInviter")
+  sentTeamInvites         TeamInvite[]             @relation("TeamInviteInviter")
+  acceptedTeamInvites     TeamInvite[]             @relation("TeamInviteAcceptedBy")
+  aiCreditAdjustments     AICredit[]
+  aiUsages                AIUsage[]
+  conversations           Conversation[]
+  messages                Message[]
+  promptsAuthored         Prompt[]
+  promptVersionsCreated   PromptVersion[]
+  promptPins              PromptPin[]
+  templatesAuthored       Template[]
+  projectsOwned           Project[]
+  filesUploaded           File[]
+  notifications           Notification[]
+  notificationPreferences NotificationPreference[]
+  auditLogs               AuditLog[]
+  activities              Activity[]
+  apiKeysCreated          ApiKey[]
+  webhooksCreated         Webhook[]
+  paymentsInitiated       Payment[]
+
+  @@index([deletedAt])
+  @@map("users")
+}
+
+model Session {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String    @db.Uuid
+  tokenHash String    @unique
+  userAgent String?
+  ipAddress String?
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+/// A Role is workspace-scoped (`workspaceId` set → CUSTOM role, Enterprise
+/// only) or global (`workspaceId` null → one of the six SYSTEM roles seeded
+/// once and reused by every workspace: Owner/Admin/Manager/Member/Viewer/Guest).
+model Role {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId String?   @db.Uuid
+  key         String // e.g. "OWNER", "ADMIN", or a custom slug
+  name        String
+  description String?
+  type        RoleType
+  isDefault   Boolean   @default(false) // assigned automatically to new invites
+  deletedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  workspace        Workspace?        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  rolePermissions  RolePermission[]
+  workspaceMembers WorkspaceMember[]
+  teamInvites      TeamInvite[]
+
+  // NOTE: Prisma cannot express a partial unique index ("unique key WHERE
+  // workspaceId IS NULL") declaratively — Postgres treats every NULL as
+  // distinct in a composite unique constraint. System-role key uniqueness
+  // is therefore enforced by the seed script; a follow-up hand-written
+  // migration adds `CREATE UNIQUE INDEX ... WHERE workspace_id IS NULL`.
+  @@unique([workspaceId, key])
+  @@index([type])
+  @@map("roles")
+}
+
+enum RoleType {
+  SYSTEM
+  CUSTOM
+}
+
+/// Static, centrally-seeded catalog of atomic permissions. Never user-deletable.
+model Permission {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  key         String   @unique // e.g. "billing.manage", "content.publish"
+  description String?
+  module      String // groups permissions for admin-UI display, e.g. "billing"
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  rolePermissions RolePermission[]
+
+  @@index([module])
+  @@map("permissions")
+}
+
+/// Join table: which Permissions a Role grants.
+model RolePermission {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  roleId       String   @db.Uuid
+  permissionId String   @db.Uuid
+  createdAt    DateTime @default(now())
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+// =============================================================================
+// SECTION 2 — Tenancy (Workspace, Membership, Business Profile, Settings)
+// =============================================================================
+
+/// The tenant boundary. Every business-data row in this schema traces back
+/// to exactly one Workspace, either directly (`workspaceId`) or transitively.
+model Workspace {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String
+  slug        String    @unique
+  logoUrl     String?
+  ownerUserId String    @db.Uuid
+  isActive    Boolean   @default(true) // operational suspend flag, distinct from deletedAt
+  deletedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  owner                   User                     @relation("WorkspaceOwner", fields: [ownerUserId], references: [id])
+  members                 WorkspaceMember[]
+  teamInvites             TeamInvite[]
+  roles                   Role[]
+  businessProfiles        BusinessProfile[]
+  settings                Settings?
+  featureFlags            FeatureFlag[]
+  subscriptions           Subscription[]
+  payments                Payment[]
+  invoices                Invoice[]
+  aiCredits               AICredit[]
+  aiUsages                AIUsage[]
+  projects                Project[]
+  folders                 Folder[]
+  files                   File[]
+  conversations           Conversation[]
+  prompts                 Prompt[]
+  promptCategories        PromptCategory[]
+  templates               Template[]
+  templateCategories      TemplateCategory[]
+  notifications           Notification[]
+  notificationPreferences NotificationPreference[]
+  auditLogs               AuditLog[]
+  activities              Activity[]
+  apiKeys                 ApiKey[]
+  webhooks                Webhook[]
+
+  @@index([ownerUserId])
+  @@index([deletedAt])
+  @@map("workspaces")
+}
+
+/// The single most important join in the schema: a User's access to a
+/// Workspace, and which Role governs that access. One row per (user,
+/// workspace) pair — see "Future scalability" if multi-role-per-member is
+/// ever required.
+model WorkspaceMember {
+  id              String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId     String                @db.Uuid
+  userId          String                @db.Uuid
+  roleId          String                @db.Uuid
+  status          WorkspaceMemberStatus
+  moduleScope     String[] // e.g. ["sales"] for a module-scoped Manager/Member; empty = full role scope
+  invitedByUserId String?               @db.Uuid
+  joinedAt        DateTime?
+  deletedAt       DateTime?
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+
+  workspace          Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user               User            @relation("WorkspaceMemberUser", fields: [userId], references: [id], onDelete: Cascade)
+  role               Role            @relation(fields: [roleId], references: [id])
+  invitedBy          User?           @relation("WorkspaceMemberInviter", fields: [invitedByUserId], references: [id])
+  projectMemberships ProjectMember[]
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+  @@index([roleId])
+  @@index([status])
+  @@map("workspace_members")
+}
+
+enum WorkspaceMemberStatus {
+  INVITED
+  ACTIVE
+  SUSPENDED
+  REMOVED
+}
+
+model TeamInvite {
+  id               String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId      String       @db.Uuid
+  email            String
+  roleId           String       @db.Uuid
+  invitedByUserId  String       @db.Uuid
+  token            String       @unique
+  status           InviteStatus
+  expiresAt        DateTime
+  acceptedAt       DateTime?
+  acceptedByUserId String?      @db.Uuid
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  workspace  Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  role       Role      @relation(fields: [roleId], references: [id])
+  invitedBy  User      @relation("TeamInviteInviter", fields: [invitedByUserId], references: [id])
+  acceptedBy User?     @relation("TeamInviteAcceptedBy", fields: [acceptedByUserId], references: [id])
+
+  // App-layer enforces at most one PENDING invite per (workspaceId, email);
+  // a Postgres partial unique index is the recommended hardening follow-up.
+  @@index([workspaceId, email])
+  @@index([status])
+  @@index([expiresAt])
+  @@map("team_invites")
+}
+
+enum InviteStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  EXPIRED
+  REVOKED
+}
+
+/// The grounding context object referenced by nearly every AI-generating
+/// feature. Deliberately workspace-level (not project-level) so voice/brand
+/// stays consistent across everything generated in that workspace.
+model BusinessProfile {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId    String    @db.Uuid
+  name           String
+  industry       String?
+  description    String?
+  targetAudience String?
+  toneAttributes Json? // structured, evolving voice attributes — see docs
+  voiceNotes     String?
+  logoFileId     String?   @db.Uuid
+  primaryColor   String?
+  secondaryColor String?
+  website        String?
+  socialLinks    Json? // [{ platform, url }]
+  offerings      Json? // [{ name, description }]
+  isDefault      Boolean   @default(true)
+  deletedAt      DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  workspace         Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  logoFile          File?          @relation(fields: [logoFileId], references: [id], onDelete: SetNull)
+  settingsAsDefault Settings[]
+  projects          Project[]
+  conversations     Conversation[]
+  images            Image[]
+
+  // App-layer enforces at most one isDefault=true row per workspace
+  // (same partial-unique-index caveat as Role above).
+  @@index([workspaceId])
+  @@map("business_profiles")
+}
+
+/// One row per Workspace. Operational defaults — not user notification
+/// preferences (see NotificationPreference) and not billing (see Subscription).
+model Settings {
+  id                       String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId              String        @unique @db.Uuid
+  defaultBusinessProfileId String?       @db.Uuid
+  timezone                 String        @default("UTC")
+  locale                   String        @default("en")
+  weekStartsOn             Int           @default(1)
+  aiOverageMode            AIOverageMode @default(HARD_STOP)
+  brandingPrimaryColor     String?
+  brandingSecondaryColor   String?
+  createdAt                DateTime      @default(now())
+  updatedAt                DateTime      @updatedAt
+
+  workspace              Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  defaultBusinessProfile BusinessProfile? @relation(fields: [defaultBusinessProfileId], references: [id], onDelete: SetNull)
+
+  @@map("workspace_settings")
+}
+
+enum AIOverageMode {
+  HARD_STOP
+  SOFT_ALLOW
+}
+
+/// Global flag definitions (`workspaceId` null) plus optional per-workspace
+/// overrides (`workspaceId` set). Read pattern: look up the override row
+/// first, fall back to the global definition's `isEnabledByDefault`.
+model FeatureFlag {
+  id                 String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  key                String
+  name               String
+  description        String?
+  type               FeatureFlagType
+  isEnabledByDefault Boolean         @default(false)
+  rolloutPercentage  Int? // 0-100, used when type = PERCENTAGE_ROLLOUT
+  workspaceId        String?         @db.Uuid
+  isEnabled          Boolean? // override value; only meaningful on workspace-scoped rows
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([key, workspaceId])
+  @@map("feature_flags")
+}
+
+enum FeatureFlagType {
+  BOOLEAN
+  PERCENTAGE_ROLLOUT
+  PLAN_GATED
+}
+
+// =============================================================================
+// SECTION 3 — Billing & Subscriptions
+// =============================================================================
+
+model SubscriptionPlan {
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  key                  String   @unique // "free" | "starter" | "pro" | "business" | "enterprise" | custom
+  tier                 PlanTier
+  name                 String
+  description          String?
+  priceMonthlyCents    Int? // null for "contact us" custom Enterprise pricing
+  priceAnnualCents     Int?
+  currency             String   @default("usd")
+  aiCreditsPerMonth    Int
+  maxWorkspaces        Int? // null = unlimited
+  maxTeamSeats         Int?
+  maxBusinessProfiles  Int?
+  maxActiveProjects    Int?
+  historyRetentionDays Int
+  featureMatrix        Json // per-module capability matrix, see PRD §9
+  isActive             Boolean  @default(true) // catalog visibility; plans are never hard-deleted
+  sortOrder            Int      @default(0)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  subscriptions Subscription[]
+
+  @@index([tier])
+  @@index([isActive])
+  @@map("subscription_plans")
+}
+
+enum PlanTier {
+  FREE
+  STARTER
+  PRO
+  BUSINESS
+  ENTERPRISE
+}
+
+model Subscription {
+  id                 String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId        String             @db.Uuid
+  planId             String             @db.Uuid
+  status             SubscriptionStatus
+  billingInterval    BillingInterval
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  cancelAtPeriodEnd  Boolean            @default(false)
+  canceledAt         DateTime?
+  trialEndsAt        DateTime?
+  provider           PaymentProvider    @default(STRIPE)
+  externalProviderId String?            @unique
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  workspace Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  plan      SubscriptionPlan @relation(fields: [planId], references: [id])
+  payments  Payment[]
+  invoices  Invoice[]
+  aiCredits AICredit[]
+
+  // App-layer enforces at most one row with status IN (TRIALING, ACTIVE,
+  // PAST_DUE) per workspace at a time (partial-unique-index caveat, as above).
+  @@index([workspaceId])
+  @@index([status])
+  @@index([workspaceId, status])
+  @@map("subscriptions")
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  EXPIRED
+  PAUSED
+}
+
+enum BillingInterval {
+  MONTHLY
+  ANNUAL
+}
+
+enum PaymentProvider {
+  STRIPE
+  PAYPAL
+  MANUAL
+}
+
+/// Never stores raw payment method data (PCI scope stays with the provider).
+model Payment {
+  id                   String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId          String          @db.Uuid
+  subscriptionId       String?         @db.Uuid
+  invoiceId            String?         @db.Uuid
+  amountCents          Int
+  currency             String          @default("usd")
+  status               PaymentStatus
+  provider             PaymentProvider
+  externalPaymentId    String?         @unique
+  paymentMethodSummary String? // display-only snapshot, e.g. "Visa •••• 4242"
+  failureReason        String?
+  initiatedByUserId    String?         @db.Uuid
+  createdAt            DateTime        @default(now())
+
+  workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  invoice      Invoice?      @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  initiatedBy  User?         @relation(fields: [initiatedByUserId], references: [id], onDelete: SetNull)
+  aiCredits    AICredit[]
+
+  @@index([workspaceId])
+  @@index([status])
+  @@index([subscriptionId])
+  @@map("payments")
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+model Invoice {
+  id                String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId       String        @db.Uuid
+  subscriptionId    String?       @db.Uuid
+  number            String        @unique
+  status            InvoiceStatus
+  subtotalCents     Int
+  taxCents          Int           @default(0)
+  totalCents        Int
+  currency          String        @default("usd")
+  dueAt             DateTime?
+  paidAt            DateTime?
+  pdfUrl            String?
+  externalInvoiceId String?       @unique
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  items        InvoiceItem[]
+  payments     Payment[]
+  aiCredits    AICredit[]
+
+  @@index([workspaceId])
+  @@index([status])
+  @@map("invoices")
+}
+
+enum InvoiceStatus {
+  DRAFT
+  OPEN
+  PAID
+  VOID
+  UNCOLLECTIBLE
+}
+
+model InvoiceItem {
+  id              String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  invoiceId       String          @db.Uuid
+  type            InvoiceItemType
+  description     String
+  quantity        Int             @default(1)
+  unitAmountCents Int
+  amountCents     Int
+  createdAt       DateTime        @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+  @@map("invoice_items")
+}
+
+enum InvoiceItemType {
+  SUBSCRIPTION
+  AI_CREDIT_TOPUP
+  OVERAGE
+  ADJUSTMENT
+  TAX
+  DISCOUNT
+}
+
+// =============================================================================
+// SECTION 4 — AI Platform (Credits, Usage, Conversations, Prompts, Templates)
+// =============================================================================
+
+/// Ledger of credit SUPPLY (grants, top-ups, rollovers, refunds, manual
+/// adjustments). Consumption is recorded separately in AIUsage — balance is
+/// always `sum(AICredit.amount) - sum(AIUsage.creditsConsumed)`.
+model AICredit {
+  id                    String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId           String                  @db.Uuid
+  type                  AICreditTransactionType
+  amount                Int // positive = credit added, negative = removed (EXPIRATION, clawback)
+  balanceAfter          Int // denormalized running-balance snapshot — see docs for the tradeoff
+  relatedSubscriptionId String?                 @db.Uuid
+  relatedPaymentId      String?                 @db.Uuid
+  relatedInvoiceId      String?                 @db.Uuid
+  note                  String?
+  expiresAt             DateTime?
+  createdByUserId       String?                 @db.Uuid
+  createdAt             DateTime                @default(now())
+
+  workspace           Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  relatedSubscription Subscription? @relation(fields: [relatedSubscriptionId], references: [id], onDelete: SetNull)
+  relatedPayment      Payment?      @relation(fields: [relatedPaymentId], references: [id], onDelete: SetNull)
+  relatedInvoice      Invoice?      @relation(fields: [relatedInvoiceId], references: [id], onDelete: SetNull)
+  createdBy           User?         @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, createdAt])
+  @@index([type])
+  @@map("ai_credits")
+}
+
+enum AICreditTransactionType {
+  PLAN_GRANT
+  ROLLOVER
+  TOPUP_PURCHASE
+  PROMOTIONAL
+  REFUND
+  MANUAL_ADJUSTMENT
+  EXPIRATION
+}
+
+/// One row per AI action taken — the consumption DEBIT ledger.
+/// `relatedEntityType`/`relatedEntityId` is a deliberate polymorphic pointer
+/// (string, not FK) so future microservices (Sales/Support/Marketing) can be
+/// referenced without a cross-database foreign key.
+model AIUsage {
+  id                String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId       String        @db.Uuid
+  userId            String?       @db.Uuid // null for system/automation-triggered actions
+  actionType        AIActionType
+  status            AIUsageStatus
+  creditsConsumed   Int
+  conversationId    String?       @db.Uuid
+  messageId         String?       @unique @db.Uuid
+  promptId          String?       @db.Uuid
+  relatedEntityType String?
+  relatedEntityId   String?
+  modelProvider     String?
+  modelName         String?
+  latencyMs         Int?
+  createdAt         DateTime      @default(now())
+
+  workspace      Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user           User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+  conversation   Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  message        Message?      @relation(fields: [messageId], references: [id], onDelete: SetNull)
+  prompt         Prompt?       @relation(fields: [promptId], references: [id], onDelete: SetNull)
+  generatedImage Image?
+
+  @@index([workspaceId, createdAt])
+  @@index([userId])
+  @@index([actionType])
+  @@index([relatedEntityType, relatedEntityId])
+  @@map("ai_usages")
+}
+
+enum AIActionType {
+  COPILOT_CHAT
+  CONTENT_SHORT
+  CONTENT_LONGFORM
+  IMAGE_GENERATION
+  CALL_SUMMARY
+  AUTOMATION_RUN
+  INSIGHTS_REPORT
+  OTHER
+}
+
+enum AIUsageStatus {
+  SUCCEEDED
+  FAILED
+  BLOCKED_BY_GUARDRAIL
+  BLOCKED_BY_CREDIT_LIMIT
+}
+
+model Conversation {
+  id                String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId       String             @db.Uuid
+  projectId         String?            @db.Uuid
+  businessProfileId String?            @db.Uuid
+  source            ConversationSource
+  title             String?
+  createdByUserId   String?            @db.Uuid
+  deletedAt         DateTime?
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  workspace       Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project         Project?         @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  businessProfile BusinessProfile? @relation(fields: [businessProfileId], references: [id], onDelete: SetNull)
+  createdBy       User?            @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
+  messages        Message[]
+  aiUsages        AIUsage[]
+
+  @@index([workspaceId])
+  @@index([projectId])
+  @@index([createdByUserId])
+  @@map("conversations")
+}
+
+enum ConversationSource {
+  COPILOT
+  CONTENT_CREATION
+  SALES_ASSISTANT
+  SUPPORT_AGENT
+  AUTOMATION
+}
+
+model Message {
+  id              String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  conversationId  String      @db.Uuid
+  role            MessageRole
+  authorUserId    String?     @db.Uuid
+  content         String      @db.Text
+  tokenCount      Int?
+  creditsConsumed Int? // denormalized copy of AIUsage.creditsConsumed for fast display
+  metadata        Json? // provider/tool-call metadata, varies by model — see docs
+  createdAt       DateTime    @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  author       User?        @relation(fields: [authorUserId], references: [id], onDelete: SetNull)
+  aiUsage      AIUsage?
+
+  @@index([conversationId, createdAt])
+  @@map("messages")
+}
+
+enum MessageRole {
+  SYSTEM
+  USER
+  ASSISTANT
+  TOOL
+}
+
+model PromptCategory {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId String?  @db.Uuid // null = global/system category
+  name        String
+  slug        String
+  description String?
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  prompts   Prompt[]
+
+  @@unique([workspaceId, slug])
+  @@map("prompt_categories")
+}
+
+/// The stable identity/container. The actual editable content lives in
+/// PromptVersion — see "every prompt is versioned" in the product design.
+model Prompt {
+  id               String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId      String           @db.Uuid
+  categoryId       String?          @db.Uuid
+  authorUserId     String           @db.Uuid
+  currentVersionId String?          @unique @db.Uuid
+  visibility       PromptVisibility
+  targetFeature    String? // e.g. "sales.follow_up"
+  usageCount       Int              @default(0) // denormalized counter, reconciled periodically
+  deletedAt        DateTime?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  workspace      Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  category       PromptCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  author         User            @relation(fields: [authorUserId], references: [id])
+  currentVersion PromptVersion?  @relation("PromptCurrentVersion", fields: [currentVersionId], references: [id], onDelete: SetNull)
+  versions       PromptVersion[] @relation("PromptVersions")
+  pins           PromptPin[]
+  aiUsages       AIUsage[]
+
+  @@index([workspaceId, visibility])
+  @@index([categoryId])
+  @@index([authorUserId])
+  @@map("prompts")
+}
+
+enum PromptVisibility {
+  PERSONAL
+  WORKSPACE
+}
+
+model PromptVersion {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  promptId         String   @db.Uuid
+  versionNumber    Int
+  title            String
+  body             String   @db.Text
+  estimatedCredits Int?
+  createdByUserId  String   @db.Uuid
+  createdAt        DateTime @default(now())
+
+  prompt           Prompt  @relation("PromptVersions", fields: [promptId], references: [id], onDelete: Cascade)
+  currentForPrompt Prompt? @relation("PromptCurrentVersion")
+  createdBy        User    @relation(fields: [createdByUserId], references: [id])
+  generatedImages  Image[]
+
+  @@unique([promptId, versionNumber])
+  @@map("prompt_versions")
+}
+
+/// Per-user favorite/pin — deliberately its own join, not a boolean on
+/// Prompt, since pinning is a personal preference, not a global property.
+model PromptPin {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String   @db.Uuid
+  promptId  String   @db.Uuid
+  createdAt DateTime @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  prompt Prompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, promptId])
+  @@map("prompt_pins")
+}
+
+model TemplateCategory {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId String?  @db.Uuid
+  name        String
+  slug        String
+  description String?
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  templates Template[]
+
+  @@unique([workspaceId, slug])
+  @@map("template_categories")
+}
+
+model Template {
+  id             String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId    String?            @db.Uuid // null = system template
+  categoryId     String?            @db.Uuid
+  authorUserId   String?            @db.Uuid
+  type           TemplateType
+  visibility     TemplateVisibility
+  title          String
+  description    String?
+  body           String             @db.Text
+  variableSchema Json? // declares expected {{tokens}} and their source
+  usageCount     Int                @default(0)
+  deletedAt      DateTime?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  workspace       Workspace?        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  category        TemplateCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  author          User?             @relation(fields: [authorUserId], references: [id], onDelete: SetNull)
+  projectsCreated Project[]
+
+  @@index([workspaceId, type])
+  @@index([categoryId])
+  @@index([visibility])
+  @@map("templates")
+}
+
+enum TemplateType {
+  CONTENT
+  EMAIL
+  SALES
+  SUPPORT
+  PROJECT
+}
+
+enum TemplateVisibility {
+  SYSTEM
+  WORKSPACE
+  PERSONAL
+}
+
+// =============================================================================
+// SECTION 5 — Content & Files (Projects, Folders, Files, Images)
+// =============================================================================
+
+model Project {
+  id                    String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId           String        @db.Uuid
+  businessProfileId     String?       @db.Uuid
+  name                  String
+  description           String?
+  status                ProjectStatus
+  createdFromTemplateId String?       @db.Uuid
+  ownerUserId           String        @db.Uuid
+  deletedAt             DateTime?
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  workspace           Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  businessProfile     BusinessProfile? @relation(fields: [businessProfileId], references: [id], onDelete: SetNull)
+  createdFromTemplate Template?        @relation(fields: [createdFromTemplateId], references: [id], onDelete: SetNull)
+  owner               User             @relation(fields: [ownerUserId], references: [id])
+  members             ProjectMember[]
+  folders             Folder[]
+  files               File[]
+  conversations       Conversation[]
+
+  @@index([workspaceId])
+  @@index([status])
+  @@index([ownerUserId])
+  @@map("projects")
+}
+
+enum ProjectStatus {
+  DRAFT
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+  ARCHIVED
+}
+
+/// Project membership must be a subset of workspace membership — referencing
+/// WorkspaceMember (not User directly) enforces that structurally.
+model ProjectMember {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId         String   @db.Uuid
+  workspaceMemberId String   @db.Uuid
+  createdAt         DateTime @default(now())
+
+  project         Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  workspaceMember WorkspaceMember @relation(fields: [workspaceMemberId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, workspaceMemberId])
+  @@map("project_members")
+}
+
+model Folder {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId    String    @db.Uuid
+  projectId      String?   @db.Uuid
+  parentFolderId String?   @db.Uuid
+  name           String
+  deletedAt      DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project   Project?  @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  parent    Folder?   @relation("FolderHierarchy", fields: [parentFolderId], references: [id], onDelete: SetNull)
+  children  Folder[]  @relation("FolderHierarchy")
+  files     File[]
+
+  // App-layer enforces parentFolderId (when set) belongs to the same workspaceId.
+  @@index([workspaceId])
+  @@index([projectId])
+  @@index([parentFolderId])
+  @@map("folders")
+}
+
+model File {
+  id               String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId      String     @db.Uuid
+  folderId         String?    @db.Uuid
+  projectId        String?    @db.Uuid
+  uploadedByUserId String?    @db.Uuid
+  kind             FileKind
+  status           FileStatus
+  fileName         String
+  mimeType         String
+  sizeBytes        BigInt
+  storageKey       String // object-storage key; binary content never lives in Postgres
+  storageUrl       String? // cached signed/public URL, may be regenerated
+  checksum         String? // sha256, for de-duplication/integrity
+  deletedAt        DateTime?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  workspace            Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  folder               Folder?           @relation(fields: [folderId], references: [id], onDelete: SetNull)
+  project              Project?          @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  uploadedBy           User?             @relation(fields: [uploadedByUserId], references: [id], onDelete: SetNull)
+  image                Image?
+  businessProfileLogos BusinessProfile[]
+
+  @@index([workspaceId])
+  @@index([folderId])
+  @@index([projectId])
+  @@index([checksum])
+  @@map("files")
+}
+
+enum FileKind {
+  DOCUMENT
+  IMAGE
+  VIDEO
+  AUDIO
+  ARCHIVE
+  OTHER
+}
+
+enum FileStatus {
+  UPLOADING
+  READY
+  PROCESSING
+  FAILED
+}
+
+/// Specializes File with image-specific metadata. 1:1 composition, not
+/// inheritance — keeps File generic for every asset kind.
+model Image {
+  id                         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  fileId                     String   @unique @db.Uuid
+  width                      Int?
+  height                     Int?
+  altText                    String?
+  dominantColor              String?
+  generatedByPromptVersionId String?  @db.Uuid
+  generatedByAiUsageId       String?  @unique @db.Uuid
+  businessProfileId          String?  @db.Uuid
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+
+  file                     File             @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  generatedByPromptVersion PromptVersion?   @relation(fields: [generatedByPromptVersionId], references: [id], onDelete: SetNull)
+  generatedByAiUsage       AIUsage?         @relation(fields: [generatedByAiUsageId], references: [id], onDelete: SetNull)
+  businessProfile          BusinessProfile? @relation(fields: [businessProfileId], references: [id], onDelete: SetNull)
+
+  @@map("images")
+}
+
+// =============================================================================
+// SECTION 6 — Collaboration & Governance (Notifications, Audit, Activity)
+// =============================================================================
+
+model NotificationPreference {
+  id          String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String               @db.Uuid
+  workspaceId String               @db.Uuid
+  category    NotificationCategory
+  channel     NotificationChannel
+  enabled     Boolean              @default(true)
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, workspaceId, category, channel])
+  @@map("notification_preferences")
+}
+
+model Notification {
+  id                String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId       String?              @db.Uuid
+  recipientUserId   String               @db.Uuid
+  category          NotificationCategory
+  channel           NotificationChannel
+  title             String
+  body              String?
+  linkUrl           String?
+  relatedEntityType String?
+  relatedEntityId   String?
+  readAt            DateTime?
+  sentAt            DateTime?
+  createdAt         DateTime             @default(now())
+
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  recipient User       @relation(fields: [recipientUserId], references: [id], onDelete: Cascade)
+
+  @@index([recipientUserId, readAt])
+  @@index([workspaceId, category])
+  @@index([createdAt])
+  @@map("notifications")
+}
+
+enum NotificationCategory {
+  AI
+  SALES
+  SUPPORT
+  MARKETING
+  TEAM
+  BILLING
+  SYSTEM
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  PUSH
+}
+
+/// Immutable compliance record. Deliberately has no `updatedAt` — rows are
+/// never mutated after insert, only appended.
+model AuditLog {
+  id            String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId   String         @db.Uuid
+  actorUserId   String?        @db.Uuid // null = system-initiated
+  action        AuditLogAction
+  entityType    String
+  entityId      String
+  previousValue Json?
+  newValue      Json?
+  ipAddress     String?
+  userAgent     String?
+  createdAt     DateTime       @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  actor     User?     @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, createdAt])
+  @@index([entityType, entityId])
+  @@index([actorUserId])
+  @@map("audit_logs")
+}
+
+enum AuditLogAction {
+  CREATE
+  UPDATE
+  DELETE
+  RESTORE
+  PERMISSION_CHANGE
+  LOGIN
+  LOGOUT
+  BILLING_CHANGE
+  SETTINGS_CHANGE
+}
+
+/// Lightweight, human-facing feed — NOT the compliance record (see AuditLog).
+/// Immutable, no `updatedAt`. `summary` is pre-rendered/denormalized for fast
+/// feed rendering without joining across every possible entity type.
+model Activity {
+  id                String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId       String       @db.Uuid
+  actorUserId       String?      @db.Uuid
+  type              ActivityType
+  summary           String
+  relatedEntityType String?
+  relatedEntityId   String?
+  createdAt         DateTime     @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  actor     User?     @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, createdAt])
+  @@map("activities")
+}
+
+enum ActivityType {
+  CONTENT_PUBLISHED
+  DEAL_MOVED
+  TICKET_RESOLVED
+  MEMBER_JOINED
+  PROJECT_CREATED
+  AI_GENERATION
+  COMMENT_ADDED
+}
+
+// =============================================================================
+// SECTION 7 — Extensibility (API Keys, Webhooks)
+// =============================================================================
+
+model ApiKey {
+  id              String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId     String       @db.Uuid
+  createdByUserId String       @db.Uuid
+  name            String
+  keyPrefix       String // short, non-secret, shown in UI e.g. "bzp_live_ab12"
+  hashedKey       String       @unique // raw key is never stored
+  scope           ApiKeyScope
+  status          ApiKeyStatus
+  lastUsedAt      DateTime?
+  expiresAt       DateTime?
+  revokedAt       DateTime?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy User      @relation(fields: [createdByUserId], references: [id])
+
+  @@index([workspaceId])
+  @@index([status])
+  @@map("api_keys")
+}
+
+enum ApiKeyScope {
+  READ_ONLY
+  READ_WRITE
+  FULL_ACCESS
+}
+
+enum ApiKeyStatus {
+  ACTIVE
+  REVOKED
+  EXPIRED
+}
+
+model Webhook {
+  id                      String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId             String             @db.Uuid
+  createdByUserId         String             @db.Uuid
+  url                     String
+  secret                  String // HMAC signing secret — encrypted at rest via infra/secrets layer
+  eventTypes              WebhookEventType[]
+  status                  WebhookStatus
+  lastTriggeredAt         DateTime?
+  lastFailureAt           DateTime?
+  consecutiveFailureCount Int                @default(0)
+  createdAt               DateTime           @default(now())
+  updatedAt               DateTime           @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy User      @relation(fields: [createdByUserId], references: [id])
+
+  @@index([workspaceId])
+  @@index([status])
+  @@map("webhooks")
+}
+
+enum WebhookEventType {
+  DEAL_UPDATED
+  TICKET_CREATED
+  CONTENT_PUBLISHED
+  AI_GENERATION_COMPLETED
+  INVOICE_PAID
+  MEMBER_INVITED
+}
+
+enum WebhookStatus {
+  ACTIVE
+  DISABLED
+  FAILING
+}
