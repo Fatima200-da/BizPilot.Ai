@@ -1,0 +1,166 @@
+# Phase 23: production deployment topology — backend + frontend/nginx +
+# PostgreSQL wired together, matching this phase's architecture diagram
+# (Browser -> Frontend/Nginx :80 -> /api -> Backend -> PostgreSQL).
+#
+# Phase 28: added the `scheduler` service — the real, long-running
+# scheduler+worker process for the `scheduled-workflow-run` job lane
+# (src/scripts/run-scheduler.ts). It reuses the exact same backend image
+# (no separate Dockerfile) with its CMD overridden, since the code it runs
+# is already a real, tested, standalone entry point — building a second
+# image for the same source would be pure duplication. Phase 27's
+# `credit-grant-sweep` job lane is intentionally NOT run continuously here:
+# run-job-worker.ts is designed for periodic external invocation (a real
+# host/platform cron), same as before this phase; that model is unchanged
+# and was already certified in Phase 27.
+#
+# Secrets policy: every secret below is read from the *deploying shell's*
+# environment via `${VAR}` — this file is safe to commit because it
+# contains no real values. Populate a local, gitignored `.env` (or your
+# platform's secret manager) before running `docker compose --env-file`.
+# Phase 28: PAYMENT_PROVIDER defaults to `mock`, matching AI_PROVIDER's
+# existing pattern — STRIPE_* vars are only required when explicitly set to
+# `stripe` (env.ts's own fail-fast `superRefine` enforces this at startup,
+# not this file).
+#
+# This file documents the intended topology; runtime certification
+# (Phase 23/26/27, and Phase 28 — see docs/PHASE_28_*.md) has consistently
+# been performed via direct `docker build`/`docker run` against the real
+# `bizpilot_ai_dev` database over `host.docker.internal`, not `docker
+# compose up` against this file's bundled Postgres — starting the bundled
+# service would create a second, different, empty database. The service
+# definitions here (image, env, command, healthcheck) are kept in exact
+# sync with what is actually run, so this file is accurate as reference
+# even though `docker compose up` itself is not the certified path.
+name: bizpilot-ai-prod
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: bizpilot-ai-postgres-prod
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-bizpilot_ai_prod}
+    volumes:
+      - bizpilot_ai_postgres_prod_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [bizpilot-net]
+    # No published port to the host — only reachable from other containers
+    # on bizpilot-net, matching the least-privilege-network principle used
+    # for the database role itself (Phase 22).
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: bizpilot-ai-backend-prod
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: '4000'
+      API_PREFIX: /api/v1
+      CORS_ORIGIN: ${CORS_ORIGIN:?CORS_ORIGIN is required — the real frontend origin, never localhost}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-bizpilot_ai_prod}?schema=public
+      USE_PGLITE_ADAPTER: 'false' # never overridden in production — see env.ts's fail-fast guard
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required — generate with e.g. openssl rand -base64 48}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required and must differ from JWT_SECRET}
+      AI_PROVIDER: ${AI_PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-mock}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_PUBLISHABLE_KEY: ${STRIPE_PUBLISHABLE_KEY:-}
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:4000/health/ready',(r)=>{process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    networks: [bizpilot-net]
+    # No published port to the host in production — the frontend's nginx
+    # reaches it over bizpilot-net via BACKEND_UPSTREAM=backend:4000, the
+    # browser never talks to it directly. Uncomment for direct debugging:
+    # ports: ['4000:4000']
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: bizpilot-ai-scheduler-prod
+    command: ["node", "dist/scripts/run-scheduler.js"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      # PORT/API_PREFIX/CORS_ORIGIN are validated by env.ts on every process
+      # that imports it, even though this process never opens an HTTP
+      # listener — real values are supplied so startup validation succeeds
+      # the same way it does for `backend`, not weakened for this process.
+      PORT: '4000'
+      API_PREFIX: /api/v1
+      CORS_ORIGIN: ${CORS_ORIGIN:?CORS_ORIGIN is required — the real frontend origin, never localhost}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-bizpilot_ai_prod}?schema=public
+      USE_PGLITE_ADAPTER: 'false'
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required — generate with e.g. openssl rand -base64 48}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required and must differ from JWT_SECRET}
+      AI_PROVIDER: ${AI_PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-mock}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_PUBLISHABLE_KEY: ${STRIPE_PUBLISHABLE_KEY:-}
+    healthcheck:
+      # No HTTP endpoint — liveness is "the node process holding the tick
+      # loop is still running." A crashed process (uncaught exception in
+      # the loop's own `.catch`, which calls `process.exit(1)`) makes this
+      # fail immediately rather than reporting a false "healthy".
+      test: ["CMD", "node", "-e", "process.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    networks: [bizpilot-net]
+    # No published port — this process never listens on one.
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api/v1} # same-origin via the nginx /api proxy by default
+    container_name: bizpilot-ai-frontend-prod
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      BACKEND_UPSTREAM: backend:4000
+    ports:
+      - '${FRONTEND_PORT:-80}:80'
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O-', 'http://localhost:80/']
+      interval: 15s
+      timeout: 5s
+      start_period: 5s
+      retries: 5
+    networks: [bizpilot-net]
+
+networks:
+  bizpilot-net:
+    name: bizpilot-ai-prod-net
+
+volumes:
+  bizpilot_ai_postgres_prod_data:
+    name: bizpilot_ai_postgres_prod_data

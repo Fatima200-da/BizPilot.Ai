@@ -13,6 +13,16 @@
 // pattern used by AIUsage/Notification/Activity/AuditLog).
 // =============================================================================
 
+// Phase 16: the application connects via the `pg` driver
+// (infrastructure/database/prisma.ts, using `@prisma/adapter-pg`) instead
+// of Prisma's own Rust query engine talking raw wire protocol directly.
+// Driver adapters are GA in this Prisma version (no preview flag needed).
+// This is Prisma's own, officially-supported connection mechanism — not a
+// parallel abstraction — adopted because it is the connection path that
+// was actually verified end-to-end in this phase (see
+// docs/PHASE_16_PRODUCTION_DATA_AND_VERIFICATION.md Section 4). It is
+// fully compatible with real PostgreSQL (Docker/production), not merely a
+// workaround for this phase's verification environment.
 generator client {
   provider        = "prisma-client-js"
   previewFeatures = ["postgresqlExtensions"]
@@ -44,29 +54,35 @@ model User {
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
-  sessions                Session[]
-  ownedWorkspaces         Workspace[]              @relation("WorkspaceOwner")
-  workspaceMemberships    WorkspaceMember[]        @relation("WorkspaceMemberUser")
-  invitedWorkspaceMembers WorkspaceMember[]        @relation("WorkspaceMemberInviter")
-  sentTeamInvites         TeamInvite[]             @relation("TeamInviteInviter")
-  acceptedTeamInvites     TeamInvite[]             @relation("TeamInviteAcceptedBy")
-  aiCreditAdjustments     AICredit[]
-  aiUsages                AIUsage[]
-  conversations           Conversation[]
-  messages                Message[]
-  promptsAuthored         Prompt[]
-  promptVersionsCreated   PromptVersion[]
-  promptPins              PromptPin[]
-  templatesAuthored       Template[]
-  projectsOwned           Project[]
-  filesUploaded           File[]
-  notifications           Notification[]
-  notificationPreferences NotificationPreference[]
-  auditLogs               AuditLog[]
-  activities              Activity[]
-  apiKeysCreated          ApiKey[]
-  webhooksCreated         Webhook[]
-  paymentsInitiated       Payment[]
+  sessions                   Session[]
+  passwordResetTokens        PasswordResetToken[]
+  ownedWorkspaces            Workspace[]              @relation("WorkspaceOwner")
+  workspaceMemberships       WorkspaceMember[]        @relation("WorkspaceMemberUser")
+  invitedWorkspaceMembers    WorkspaceMember[]        @relation("WorkspaceMemberInviter")
+  sentTeamInvites            TeamInvite[]             @relation("TeamInviteInviter")
+  acceptedTeamInvites        TeamInvite[]             @relation("TeamInviteAcceptedBy")
+  aiCreditAdjustments        AICredit[]
+  aiUsages                   AIUsage[]
+  conversations              Conversation[]
+  messages                   Message[]
+  promptsAuthored            Prompt[]
+  promptVersionsCreated      PromptVersion[]
+  promptPins                 PromptPin[]
+  templatesAuthored          Template[]
+  projectsOwned              Project[]
+  filesUploaded              File[]
+  notifications              Notification[]
+  notificationPreferences    NotificationPreference[]
+  auditLogs                  AuditLog[]
+  activities                 Activity[]
+  apiKeysCreated             ApiKey[]
+  webhooksCreated            Webhook[]
+  productEvents              ProductEvent[]
+  feedbackSubmitted          Feedback[]
+  paymentsInitiated          Payment[]
+  workflowInstancesTriggered WorkflowInstance[]
+  leadsOwned                 Lead[]
+  contentAssetsApproved      ContentAsset[]
 
   @@index([deletedAt])
   @@map("users")
@@ -88,6 +104,27 @@ model Session {
   @@index([userId])
   @@index([expiresAt])
   @@map("sessions")
+}
+
+/**
+ * Phase 33 Track D: real password-reset tokens — single-use, time-limited,
+ * stored as a sha256 hash only (the exact same pattern `Session.tokenHash`
+ * already established — the raw token is never persisted anywhere, only
+ * ever held by the requester between generation and the one real
+ * verification it's checked against).
+ */
+model PasswordResetToken {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String    @db.Uuid
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
 }
 
 /// A Role is workspace-scoped (`workspaceId` set → CUSTOM role, Enterprise
@@ -180,6 +217,7 @@ model Workspace {
   settings                Settings?
   featureFlags            FeatureFlag[]
   subscriptions           Subscription[]
+  billingCustomers        BillingCustomer[]
   payments                Payment[]
   invoices                Invoice[]
   aiCredits               AICredit[]
@@ -198,6 +236,15 @@ model Workspace {
   activities              Activity[]
   apiKeys                 ApiKey[]
   webhooks                Webhook[]
+  dataExportRuns          DataExportRun[]
+  productEvents           ProductEvent[]
+  feedback                Feedback[]
+  workflowDefinitions     WorkflowDefinition[]
+  workflowInstances       WorkflowInstance[]
+  scheduledWorkflows      ScheduledWorkflow[]
+  contacts                Contact[]
+  leads                   Lead[]
+  contentAssets           ContentAsset[]
 
   @@index([ownerUserId])
   @@index([deletedAt])
@@ -280,31 +327,41 @@ enum InviteStatus {
 /// feature. Deliberately workspace-level (not project-level) so voice/brand
 /// stays consistent across everything generated in that workspace.
 model BusinessProfile {
-  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  workspaceId    String    @db.Uuid
-  name           String
-  industry       String?
-  description    String?
-  targetAudience String?
-  toneAttributes Json? // structured, evolving voice attributes — see docs
-  voiceNotes     String?
-  logoFileId     String?   @db.Uuid
-  primaryColor   String?
-  secondaryColor String?
-  website        String?
-  socialLinks    Json? // [{ platform, url }]
-  offerings      Json? // [{ name, description }]
-  isDefault      Boolean   @default(true)
-  deletedAt      DateTime?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  id              String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId     String           @db.Uuid
+  name            String
+  industry        String?
+  description     String?
+  targetAudience  String?
+  toneAttributes  Json? // structured, evolving voice attributes — see docs
+  voiceNotes      String?
+  logoFileId      String?          @db.Uuid
+  primaryColor    String?
+  secondaryColor  String?
+  website         String?
+  socialLinks     Json? // [{ platform, url }]
+  offerings       Json? // [{ name, description }]
+  // Added in Phase 15 (PRODUCT_EXECUTION_AND_MVP_ARCHITECTURE.md Section 6):
+  // the one genuinely new field the Azerbaijan-first / multi-language
+  // requirement needs — every other requested field (goals, seasonal
+  // context, preferred CTA) is workflow-run-scoped input, not a durable
+  // business-profile attribute, so it lives on WorkflowInstance.input
+  // instead of duplicating storage here.
+  contentLanguage BusinessLanguage @default(AZ)
+  isDefault       Boolean          @default(true)
+  deletedAt       DateTime?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
 
-  workspace         Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  logoFile          File?          @relation(fields: [logoFileId], references: [id], onDelete: SetNull)
+  workspace         Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  logoFile          File?              @relation(fields: [logoFileId], references: [id], onDelete: SetNull)
   settingsAsDefault Settings[]
   projects          Project[]
   conversations     Conversation[]
   images            Image[]
+  workflowInstances WorkflowInstance[]
+  contacts          Contact[]
+  contentAssets     ContentAsset[]
 
   // App-layer enforces at most one isDefault=true row per workspace
   // (same partial-unique-index caveat as Role above).
@@ -315,17 +372,35 @@ model BusinessProfile {
 /// One row per Workspace. Operational defaults — not user notification
 /// preferences (see NotificationPreference) and not billing (see Subscription).
 model Settings {
-  id                       String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  workspaceId              String        @unique @db.Uuid
-  defaultBusinessProfileId String?       @db.Uuid
-  timezone                 String        @default("UTC")
-  locale                   String        @default("en")
-  weekStartsOn             Int           @default(1)
-  aiOverageMode            AIOverageMode @default(HARD_STOP)
+  id                       String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId              String           @unique @db.Uuid
+  defaultBusinessProfileId String?          @db.Uuid
+  timezone                 String           @default("UTC")
+  locale                   String           @default("en")
+  weekStartsOn             Int              @default(1)
+  aiOverageMode            AIOverageMode    @default(HARD_STOP)
   brandingPrimaryColor     String?
   brandingSecondaryColor   String?
-  createdAt                DateTime      @default(now())
-  updatedAt                DateTime      @updatedAt
+  // Phase 26 Section 3: resumable onboarding state. `onboardingStep` is the
+  // last step the workspace completed (application-defined string enum,
+  // e.g. "workspace_created" | "profile_completed" | "plan_chosen" |
+  // "team_invited" | "first_workflow_run" | "completed") — deliberately a
+  // plain string, not a Prisma enum, so a new step can be added without a
+  // migration. `onboardingCompletedAt` is set once, never cleared.
+  onboardingStep           String           @default("workspace_created")
+  // Phase 27 Section 2: the coarse, server-authoritative status the spec
+  // requires (NOT_STARTED/IN_PROGRESS/COMPLETED/SKIPPED), layered on top of
+  // the existing fine-grained `onboardingStep` tuple (unchanged, still the
+  // resumable "where exactly did they leave off" signal). NOT_STARTED is
+  // never actually stored here — a Settings row (and therefore this column)
+  // only exists once a workspace exists, and workspace creation is itself
+  // the first real onboarding milestone; NOT_STARTED is instead computed at
+  // the user level (see onboarding.service.ts `getUserOnboardingStatus`)
+  // for a user who owns zero workspaces yet.
+  onboardingStatus         OnboardingStatus @default(IN_PROGRESS)
+  onboardingCompletedAt    DateTime?
+  createdAt                DateTime         @default(now())
+  updatedAt                DateTime         @updatedAt
 
   workspace              Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   defaultBusinessProfile BusinessProfile? @relation(fields: [defaultBusinessProfileId], references: [id], onDelete: SetNull)
@@ -336,6 +411,16 @@ model Settings {
 enum AIOverageMode {
   HARD_STOP
   SOFT_ALLOW
+}
+
+/// Phase 27 Section 2: coarse onboarding status. See the `onboardingStatus`
+/// field comment on Settings for how NOT_STARTED is handled (never stored;
+/// computed at the user level for users with zero workspaces).
+enum OnboardingStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+  SKIPPED
 }
 
 /// Global flag definitions (`workspaceId` null) plus optional per-workspace
@@ -388,10 +473,20 @@ model SubscriptionPlan {
   featureMatrix        Json // per-module capability matrix, see PRD §9
   isActive             Boolean  @default(true) // catalog visibility; plans are never hard-deleted
   sortOrder            Int      @default(0)
+  // Phase 28 Track B: real Stripe Price IDs (e.g. "price_1AbC..."), one per
+  // billing interval — null until a real Stripe product/price is created
+  // for this plan in a real Stripe account (never fabricated). Nullable by
+  // design: MockBillingProvider (the default) never reads these; a real
+  // StripeBillingProvider checkout/subscription call for a plan with no
+  // configured price ID fails with a clear, real ValidationError rather
+  // than silently falling back to something invented.
+  stripePriceIdMonthly String?
+  stripePriceIdAnnual  String?
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 
-  subscriptions Subscription[]
+  subscriptions          Subscription[] @relation("SubscriptionCurrentPlan")
+  pendingOnSubscriptions Subscription[] @relation("SubscriptionPendingPlan")
 
   @@index([tier])
   @@index([isActive])
@@ -419,14 +514,22 @@ model Subscription {
   trialEndsAt        DateTime?
   provider           PaymentProvider    @default(STRIPE)
   externalProviderId String?            @unique
+  // Phase 25 Section 12: a downgrade that would violate the target plan's
+  // limits (e.g. 10 members on PRO -> 3-member STARTER) never silently
+  // deletes data. Instead the target plan is recorded here and the
+  // workspace enters a blocked-until-compliant state (enforced by the
+  // entitlement engine) rather than an immediate plan swap.
+  pendingPlanId      String?            @db.Uuid
+  pendingPlanNote    String?
   createdAt          DateTime           @default(now())
   updatedAt          DateTime           @updatedAt
 
-  workspace Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  plan      SubscriptionPlan @relation(fields: [planId], references: [id])
-  payments  Payment[]
-  invoices  Invoice[]
-  aiCredits AICredit[]
+  workspace   Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  plan        SubscriptionPlan  @relation("SubscriptionCurrentPlan", fields: [planId], references: [id])
+  pendingPlan SubscriptionPlan? @relation("SubscriptionPendingPlan", fields: [pendingPlanId], references: [id])
+  payments    Payment[]
+  invoices    Invoice[]
+  aiCredits   AICredit[]
 
   // App-layer enforces at most one row with status IN (TRIALING, ACTIVE,
   // PAST_DUE) per workspace at a time (partial-unique-index caveat, as above).
@@ -434,6 +537,54 @@ model Subscription {
   @@index([status])
   @@index([workspaceId, status])
   @@map("subscriptions")
+}
+
+/// Phase 25 Section 13: maps a Workspace to its external billing-provider
+/// customer record. Provider-neutral — `provider`/`externalCustomerId`
+/// mirror Payment/Subscription's existing pattern rather than introducing a
+/// new convention. One row per (workspace, provider).
+model BillingCustomer {
+  id                 String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId        String          @db.Uuid
+  provider           PaymentProvider
+  externalCustomerId String
+  email              String
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, provider])
+  @@unique([provider, externalCustomerId])
+  @@map("billing_customers")
+}
+
+/// Phase 25 Section 14: idempotency ledger for INBOUND payment-provider
+/// webhooks — distinct from the existing `Webhook` model, which is for
+/// OUTBOUND customer-configured integration webhooks. A webhook must never
+/// apply the same subscription transition twice; `externalEventId` is the
+/// provider's own event id and is the uniqueness guarantee.
+model WebhookEvent {
+  id              String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  provider        PaymentProvider
+  externalEventId String
+  eventType       String
+  payload         Json
+  status          WebhookEventStatus
+  errorMessage    String?
+  receivedAt      DateTime           @default(now())
+  processedAt     DateTime?
+
+  @@unique([provider, externalEventId])
+  @@index([status])
+  @@map("webhook_events")
+}
+
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSED
+  IGNORED
+  FAILED
 }
 
 enum SubscriptionStatus {
@@ -627,6 +778,13 @@ model AIUsage {
   @@index([userId])
   @@index([actionType])
   @@index([relatedEntityType, relatedEntityId])
+  // Phase 30 Track I.17: the admin dashboard's cross-tenant 30-day usage
+  // aggregate (admin.service.ts) filters on createdAt ALONE, with no
+  // workspaceId predicate — the composite (workspaceId, createdAt) index
+  // above cannot serve that scan. Confirmed via EXPLAIN ANALYZE against the
+  // real dev database before adding; harmless at current row counts (seq
+  // scan, <1ms) but load-bearing once this table reaches production scale.
+  @@index([createdAt])
   @@map("ai_usages")
 }
 
@@ -1025,6 +1183,10 @@ model Notification {
   workspaceId       String?              @db.Uuid
   recipientUserId   String               @db.Uuid
   category          NotificationCategory
+  // Phase 26 Section 5: the specific, addressable event type — `category`
+  // remains the coarse admin-UI grouping (unchanged); `type` is what the
+  // idempotency guarantee and the frontend's icon/copy selection key off.
+  type              NotificationType
   channel           NotificationChannel
   title             String
   body              String?
@@ -1038,10 +1200,347 @@ model Notification {
   workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   recipient User       @relation(fields: [recipientUserId], references: [id], onDelete: Cascade)
 
+  // Idempotent creation: at most one notification per (workspace, type,
+  // related entity) — e.g. one CREDITS_LOW alert per workspace per billing
+  // period, one INVITATION_RECEIVED per invite. A real Postgres unique
+  // constraint, not an app-level check-then-insert race.
+  @@unique([workspaceId, type, relatedEntityId])
   @@index([recipientUserId, readAt])
   @@index([workspaceId, category])
   @@index([createdAt])
   @@map("notifications")
+}
+
+enum NotificationType {
+  WELCOME
+  ONBOARDING_REMINDER
+  INVITATION_RECEIVED
+  INVITATION_ACCEPTED
+  SUBSCRIPTION_CHANGED
+  SUBSCRIPTION_CANCELED
+  SUBSCRIPTION_REACTIVATED
+  PLAN_LIMIT_WARNING
+  CREDITS_LOW
+  CREDITS_EXHAUSTED
+  WORKFLOW_COMPLETED
+  WORKFLOW_FAILED
+  // Phase 29: previously-missing notification coverage found during the
+  // repository audit — a scheduled run completing/failing and a payment
+  // failure both had real handler code paths but no matching notification.
+  WORKFLOW_RETRYING
+  SCHEDULED_WORKFLOW_COMPLETED
+  PAYMENT_FAILED
+  APPROVAL_REQUIRED
+  SECURITY_EVENT
+}
+
+/// Phase 29 Section 4: a lightweight, first-party product-event log — the
+/// foundation every activation/retention/admin-intelligence metric this
+/// phase adds is computed from. Deliberately NOT a general-purpose
+/// analytics platform (no schema-per-event-type, no separate ingestion
+/// service) — one flat table, one index per real query shape this phase
+/// actually needs. `workspaceId`/`userId` are both nullable: some events
+/// (`signup_started`) happen before either exists.
+model ProductEvent {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId String?  @db.Uuid
+  userId      String?  @db.Uuid
+  eventName   String
+  entityType  String?
+  entityId    String?
+  /// Structured event context. Never a raw AI prompt/completion, password,
+  /// token, or API key — see phase28/29 security regression for a real,
+  /// executed test proving this.
+  properties  Json?
+  createdAt   DateTime @default(now())
+
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User?      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, eventName, createdAt])
+  @@index([eventName, createdAt])
+  @@index([userId, createdAt])
+  @@map("product_events")
+}
+
+/// Phase 29 Section 24: a lightweight, in-app customer feedback channel —
+/// deliberately minimal (no attachments, no threading, no unnecessary
+/// personal data beyond the authenticated actor already on the request).
+model Feedback {
+  id          String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId String         @db.Uuid
+  userId      String         @db.Uuid
+  type        FeedbackType
+  message     String
+  /// Free-form, server-populated context (current route, plan, browser) —
+  /// never user-editable beyond `message`, never a credential/secret.
+  context     Json?
+  status      FeedbackStatus @default(OPEN)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, createdAt])
+  @@index([status, createdAt])
+  @@index([type, createdAt])
+  @@map("feedback")
+}
+
+enum FeedbackType {
+  BUG
+  IDEA
+  QUESTION
+  GENERAL
+}
+
+enum FeedbackStatus {
+  OPEN
+  IN_REVIEW
+  RESOLVED
+  DISMISSED
+}
+
+/// Phase 26 Section 8: observable, idempotent scheduler-job ledger. The
+/// unique constraint on (jobKey, dedupeKey) is the actual concurrency
+/// guarantee ("same billing period + same workspace = exactly one grant") —
+/// mirrors WebhookEvent's proven pattern from Phase 25, not a new idea.
+model ScheduledJobRun {
+  id          String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  jobKey      String
+  dedupeKey   String
+  status      JobRunStatus
+  startedAt   DateTime     @default(now())
+  completedAt DateTime?
+  error       String?
+  createdAt   DateTime     @default(now())
+
+  @@unique([jobKey, dedupeKey])
+  @@index([jobKey, status])
+  @@map("scheduled_job_runs")
+}
+
+enum JobRunStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+/// Phase 27 Section 4: a general-purpose, lease-based production job queue —
+/// distinct from Phase 26's ScheduledJobRun (which is a narrow, single-purpose
+/// idempotency ledger for the credit-grant job specifically). This model
+/// supports arbitrary job types, claim/lease-based crash recovery (a worker
+/// that dies mid-execution loses its lease and another worker reclaims the
+/// job once `leaseExpiresAt` passes), and retry-with-backoff terminating in
+/// a dead-letter FAILED state after `maxAttempts` is exhausted.
+model Job {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  jobKey         String
+  dedupeKey      String
+  payload        Json?
+  status         JobStatus @default(PENDING)
+  attempts       Int       @default(0)
+  maxAttempts    Int       @default(5)
+  leaseOwner     String?
+  leaseExpiresAt DateTime?
+  nextRunAt      DateTime  @default(now())
+  lastError      String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  completedAt    DateTime?
+
+  // Idempotent enqueue: at most one Job per (jobKey, dedupeKey), enforced by
+  // a real Postgres unique constraint — not an app-level check-then-insert.
+  @@unique([jobKey, dedupeKey])
+  @@index([jobKey, status, nextRunAt])
+  @@map("jobs")
+}
+
+enum JobStatus {
+  PENDING
+  CLAIMED
+  RUNNING
+  RETRY_WAIT
+  SUCCEEDED
+  FAILED
+  /// Phase 29 Section 9: an admin-cancelled dead-letter job — distinct from
+  /// FAILED (which means "exhausted its real retry attempts") so
+  /// reliability metrics never conflate "the system gave up" with "an
+  /// operator decided this one should never run."
+  CANCELLED
+}
+
+/**
+ * Phase 31: a real recurring backup schedule, deliberately a small,
+ * dedicated model rather than reusing ScheduledWorkflow — a database
+ * backup is not a workflow (no WorkflowDefinition, no workspace scoping,
+ * no business input payload). Mirrors ScheduledWorkflow's already-certified
+ * duplicate-prevention pattern exactly: `nextRunAt` is claimed via an
+ * optimistic-concurrency CAS (see backup-scheduler.service.ts), with the
+ * enqueued Job's real unique (jobKey, dedupeKey) constraint as a second,
+ * independent layer of protection.
+ */
+model BackupSchedule {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name          String    @unique
+  intervalHours Int       @default(24)
+  timeOfDay     String    @default("03:00") // "HH:mm"
+  timezone      String    @default("UTC") // IANA name
+  enabled       Boolean   @default(true)
+  nextRunAt     DateTime
+  lastRunAt     DateTime?
+  lastRunStatus String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([enabled, nextRunAt])
+  @@map("backup_schedules")
+}
+
+/**
+ * Phase 31: real, persisted backup-run history and metadata — every real
+ * backup attempt (scheduled or manually triggered) gets exactly one row,
+ * whether it succeeds or fails, so observability (Track D) and retention
+ * cleanup have real data to work from rather than inferring state from
+ * on-disk files alone. `prunedAt` is set when retention cleanup deletes the
+ * on-disk artifact but deliberately keeps this row — the historical record
+ * (who ran, when, how big, how long) outlives the disk data it describes,
+ * the same way a real backup-lifecycle catalog behaves.
+ */
+model BackupRun {
+  id           String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  status       BackupStatus @default(RUNNING)
+  triggerType  String // 'SCHEDULED' | 'MANUAL'
+  jobId        String?      @db.Uuid
+  filePath     String?
+  tableCount   Int?
+  rowCount     Int?
+  sizeBytes    Int?
+  checksum     String?
+  errorMessage String?
+  startedAt    DateTime     @default(now())
+  completedAt  DateTime?
+  durationMs   Int?
+  prunedAt     DateTime?
+  createdAt    DateTime     @default(now())
+
+  // Phase 32 Track B: whether this artifact's table files are AES-256-GCM
+  // ciphertext (BACKUP_ENCRYPTION_KEY was configured at backup time).
+  encrypted Boolean @default(false)
+
+  // Phase 32 Track A: real off-site upload state — distinct from local
+  // on-disk success, since either can fail independently of the other.
+  s3Uploaded    Boolean   @default(false)
+  s3UploadedAt  DateTime?
+  s3Bucket      String?
+  s3UploadError String?
+
+  // Phase 32 Track D: automated restore verification — a real restore into
+  // an isolated schema run automatically after this backup, not merely a
+  // one-off manual rehearsal.
+  restoreVerifiedAt  DateTime?
+  restoreVerifiedOk  Boolean?
+  restoreDurationMs  Int?
+  restoreVerifyError String?
+
+  @@index([status, startedAt])
+  @@map("backup_runs")
+}
+
+enum BackupStatus {
+  RUNNING
+  SUCCEEDED
+  /// A real corruption/integrity-check failure discovered AFTER the dump
+  /// completed (checksum mismatch on self-verification) — distinct from
+  /// FAILED (an error during the dump itself), so observability can tell
+  /// "we couldn't back up" from "we backed up but the artifact is bad."
+  CORRUPT
+  FAILED
+}
+
+/**
+ * Phase 33 Track C: real, enforced data retention — a recurring purge job,
+ * mirroring BackupSchedule's already-certified duplicate-prevention and
+ * missed-run-coalescing pattern exactly (same CAS-on-nextRunAt guarantee,
+ * same Job-unique-constraint belt-and-suspenders). Deliberately weekly by
+ * default (`intervalHours: 168`) — purging is a low-urgency, high-caution
+ * operation, not a daily one.
+ */
+model DataRetentionSchedule {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name          String    @unique
+  intervalHours Int       @default(168)
+  timeOfDay     String    @default("04:00") // "HH:mm"
+  timezone      String    @default("UTC")
+  enabled       Boolean   @default(true)
+  nextRunAt     DateTime
+  lastRunAt     DateTime?
+  lastRunStatus String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([enabled, nextRunAt])
+  @@map("data_retention_schedules")
+}
+
+/**
+ * Phase 33 Track C: real, persisted purge-run history — every real purge
+ * attempt gets exactly one row, whether it succeeds or fails, mirroring
+ * BackupRun's own audit-trail-outlives-the-action design. `purgedCounts` is
+ * a real per-model breakdown (e.g. `{"lead": 12, "contact": 3, "workspaceMember": 1}`),
+ * never a single opaque total — a real operator investigating "what did
+ * this purge actually delete" must be able to answer that from this row
+ * alone, not from application logs that may have rotated away.
+ */
+model DataRetentionPurgeRun {
+  id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  status       PurgeStatus @default(RUNNING)
+  triggerType  String // 'SCHEDULED' | 'MANUAL'
+  jobId        String?     @db.Uuid
+  purgedCounts Json?
+  totalPurged  Int?
+  errorMessage String?
+  startedAt    DateTime    @default(now())
+  completedAt  DateTime?
+  durationMs   Int?
+  createdAt    DateTime    @default(now())
+
+  @@index([status, startedAt])
+  @@map("data_retention_purge_runs")
+}
+
+enum PurgeStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+/**
+ * Phase 33 Track L: a real, persisted background data-export run — the
+ * export itself runs as a real job-queue job (never synchronously inside
+ * an HTTP request, which would time out for a large workspace), so a
+ * requester polls this row for real status rather than blocking on the
+ * connection. `workspaceId` is the real, structural tenant-isolation
+ * boundary — every list/download endpoint scopes strictly by it.
+ */
+model DataExportRun {
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId       String    @db.Uuid
+  requestedByUserId String?   @db.Uuid
+  status            String    @default("RUNNING") // 'RUNNING' | 'SUCCEEDED' | 'FAILED'
+  filePath          String?
+  sizeBytes         Int?
+  errorMessage      String?
+  startedAt         DateTime  @default(now())
+  completedAt       DateTime?
+  durationMs        Int?
+  createdAt         DateTime  @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, startedAt])
+  @@map("data_export_runs")
 }
 
 enum NotificationCategory {
@@ -1094,6 +1593,8 @@ enum AuditLogAction {
   LOGOUT
   BILLING_CHANGE
   SETTINGS_CHANGE
+  /// Phase 32 Track O: a real, full workspace data export was performed — sensitive enough to warrant its own real audit trail entry.
+  DATA_EXPORT
 }
 
 /// Lightweight, human-facing feed — NOT the compliance record (see AuditLog).
@@ -1200,4 +1701,320 @@ enum WebhookStatus {
   ACTIVE
   DISABLED
   FAILING
+}
+
+// =============================================================================
+// SECTION 8 — Workflow Engine
+// Resolves AI_PLATFORM_ARCHITECTURE.md Section 10.1's explicit deferral:
+// "a WorkflowInstance's durable state... requires persistence beyond what any
+// existing DATABASE.md model provides — (future schema extension, not
+// required today)." Formalized in PRODUCT_EXECUTION_AND_MVP_ARCHITECTURE.md
+// Section 38.2. Behavior (state machine, step dispatch, retry, scheduling)
+// is fully specified there and in BACKEND_ARCHITECTURE.md Section 8 — this
+// section supplies only the persistence shape, not a new engine.
+// =============================================================================
+
+model WorkflowDefinition {
+  id              String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId     String?                  @db.Uuid // null = system-defined, available to every workspace
+  key             String // e.g. "marketing-autopilot"
+  name            String
+  description     String?
+  version         Int                      @default(1)
+  isSystemDefined Boolean                  @default(false)
+  status          WorkflowDefinitionStatus @default(ACTIVE)
+  stepGraph       Json // ordered step definitions: [{ key, order, kind, config }]
+  deletedAt       DateTime?
+  createdAt       DateTime                 @default(now())
+  updatedAt       DateTime                 @updatedAt
+
+  workspace Workspace?         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  instances WorkflowInstance[]
+
+  // NOTE: same partial-unique-index caveat as Role (workspaceId IS NULL rows
+  // are never considered duplicates by Postgres in a composite unique
+  // constraint) — system-defined key/version uniqueness is enforced by the
+  // seed script, matching the existing documented pattern for Role.
+  @@unique([workspaceId, key, version])
+  @@index([key])
+  @@map("workflow_definitions")
+}
+
+model WorkflowInstance {
+  id                   String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId          String                 @db.Uuid
+  workflowDefinitionId String                 @db.Uuid
+  businessProfileId    String?                @db.Uuid
+  triggeredByUserId    String?                @db.Uuid // null = system/scheduled trigger
+  status               WorkflowInstanceStatus @default(PENDING)
+  outcomeSignal        WorkflowOutcomeSignal  @default(PENDING)
+  idempotencyKey       String? // caller-supplied; prevents duplicate-run creation on retried requests
+  currentStepKey       String?
+  input                Json // workflow start input (goals, platform selection, etc.)
+  output               Json? // final assembled output once COMPLETED
+  error                Json? // last failure detail, if any
+  startedAt            DateTime?
+  completedAt          DateTime?
+  createdAt            DateTime               @default(now())
+  updatedAt            DateTime               @updatedAt
+
+  workspace          Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workflowDefinition WorkflowDefinition @relation(fields: [workflowDefinitionId], references: [id])
+  businessProfile    BusinessProfile?   @relation(fields: [businessProfileId], references: [id], onDelete: SetNull)
+  triggeredBy        User?              @relation(fields: [triggeredByUserId], references: [id], onDelete: SetNull)
+  stepRuns           WorkflowStepRun[]
+  contentAssets      ContentAsset[]
+
+  // Idempotency is scoped per workspace+definition, not globally, matching
+  // BACKEND_ARCHITECTURE.md Section 8.5's existing idempotency-key discipline.
+  @@unique([workspaceId, workflowDefinitionId, idempotencyKey])
+  @@index([workspaceId, status])
+  @@index([workflowDefinitionId])
+  // Phase 30 Track I.17: same real gap as ai_usages above — the admin
+  // dashboard's cross-tenant 30-day workflow-run aggregate filters on
+  // createdAt alone; the existing (workspaceId, status) index doesn't cover it.
+  @@index([createdAt])
+  @@map("workflow_instances")
+}
+
+model WorkflowStepRun {
+  id                 String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workflowInstanceId String             @db.Uuid
+  stepKey            String
+  stepOrder          Int
+  status             WorkflowStepStatus @default(PENDING)
+  attempt            Int                @default(1)
+  input              Json?
+  output             Json?
+  error              Json?
+  startedAt          DateTime?
+  completedAt        DateTime?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  workflowInstance WorkflowInstance @relation(fields: [workflowInstanceId], references: [id], onDelete: Cascade)
+
+  // Reuses BACKEND_ARCHITECTURE.md Section 8.5's idempotent-handler pattern:
+  // a retried attempt of the same step is a new row (audit trail preserved),
+  // never an in-place overwrite of a prior attempt's result.
+  @@unique([workflowInstanceId, stepKey, attempt])
+  @@index([workflowInstanceId, status])
+  @@map("workflow_step_runs")
+}
+
+enum WorkflowDefinitionStatus {
+  DRAFT
+  ACTIVE
+  DEPRECATED
+}
+
+enum WorkflowInstanceStatus {
+  PENDING
+  RUNNING
+  AWAITING_APPROVAL
+  COMPLETED
+  FAILED
+  RETRYING
+  CANCELLED
+}
+
+enum WorkflowStepStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  RETRYING
+  SKIPPED
+}
+
+enum WorkflowOutcomeSignal {
+  PENDING
+  ACCEPTED
+  EDITED
+  DISMISSED
+}
+
+/// Phase 28 Section "Recurring workflows": a persisted, server-validated
+/// recurring schedule for a real WorkflowDefinition. Timezone is stored
+/// explicitly (IANA name, e.g. "America/New_York") and interpreted via
+/// `luxon` (which uses Node's built-in ICU/timezone data) — `nextRunAt` is
+/// always computed and stored as a real UTC instant, never left to the
+/// scheduler process's local machine timezone. Duplicate-execution
+/// prevention across concurrent scheduler instances is NOT this table's
+/// job — it is the real Postgres unique constraint on the `Job` table
+/// (jobKey, dedupeKey) this scheduler enqueues into (job-queue.service.ts,
+/// Phase 27), keyed by `${scheduledWorkflowId}:${occurrence ISO}` so two
+/// scheduler processes racing to fire the same occurrence collide safely.
+model ScheduledWorkflow {
+  id                    String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId           String               @db.Uuid
+  workflowDefinitionKey String
+  businessProfileId     String?              @db.Uuid
+  createdByUserId       String?              @db.Uuid
+  name                  String
+  intervalUnit          ScheduleIntervalUnit
+  intervalValue         Int                  @default(1)
+  timeOfDay             String? // "HH:mm", required for DAY/WEEK/MONTH granularity
+  dayOfWeek             Int? // 0 (Sunday) - 6 (Saturday), required for WEEK granularity
+  timezone              String               @default("UTC") // IANA name
+  input                 Json?
+  enabled               Boolean              @default(true)
+  nextRunAt             DateTime // always a real, computed UTC instant
+  lastRunAt             DateTime?
+  lastRunStatus         String?
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime             @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([enabled, nextRunAt])
+  @@index([workspaceId])
+  @@map("scheduled_workflows")
+}
+
+enum ScheduleIntervalUnit {
+  MINUTE
+  HOUR
+  DAY
+  WEEK
+  MONTH
+}
+
+// =============================================================================
+// SECTION 9 — CRM Foundation
+// Formalized in PRODUCT_EXECUTION_AND_MVP_ARCHITECTURE.md Section 38.3.
+// Deliberately minimal — see that document's rejected-alternatives note
+// (no Deal/Opportunity/Pipeline entity at this horizon).
+// =============================================================================
+
+model Contact {
+  id                String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId       String        @db.Uuid
+  businessProfileId String?       @db.Uuid
+  fullName          String
+  phone             String?
+  email             String?
+  source            ContactSource @default(MANUAL)
+  notes             String?
+  deletedAt         DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  workspace       Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  businessProfile BusinessProfile? @relation(fields: [businessProfileId], references: [id], onDelete: SetNull)
+  leads           Lead[]
+
+  @@index([workspaceId])
+  @@index([phone])
+  @@index([email])
+  @@map("contacts")
+}
+
+model Lead {
+  id          String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId String        @db.Uuid
+  contactId   String        @db.Uuid
+  status      LeadStatus    @default(NEW)
+  source      ContactSource @default(MANUAL)
+  intent      Json? // structured classification output, extension point per PRODUCT_EXECUTION_AND_MVP_ARCHITECTURE.md Section 17
+  followUpAt  DateTime?
+  ownerUserId String?       @db.Uuid
+  notes       String?
+  deletedAt   DateTime?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  contact   Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  owner     User?     @relation(fields: [ownerUserId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, status])
+  @@index([contactId])
+  @@index([ownerUserId])
+  @@map("leads")
+}
+
+enum BusinessLanguage {
+  AZ
+  EN
+  RU
+}
+
+enum ContactSource {
+  WHATSAPP
+  INSTAGRAM
+  MANUAL
+  IMPORT
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  WON
+  LOST
+}
+
+// =============================================================================
+// SECTION 10 — Content Assets (Marketing Autopilot, Phase 15)
+// One row per calendar item generated by the Marketing Autopilot workflow
+// (Phase 15 Section 7, step 06 "Persist Content Assets") — an individually
+// addressable, editable, approvable unit, distinct from WorkflowInstance's
+// assembled `output` snapshot (Part 38.2). Justified as new because Phase 15
+// explicitly requires per-item edit/approve/status lifecycle and provenance
+// (generated vs. human-edited) — not needed by the workflow engine itself.
+// =============================================================================
+
+model ContentAsset {
+  id                 String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId        String             @db.Uuid
+  workflowInstanceId String             @db.Uuid
+  businessProfileId  String?            @db.Uuid
+  day                Int // 1-30
+  scheduledDate      DateTime?
+  platform           String // e.g. "instagram", "whatsapp_status"
+  contentType        String // e.g. "carousel", "reel", "story", "single_post"
+  pillarKey          String?
+  topic              String
+  hook               String?
+  keyMessage         String?
+  caption            String // AI-generated caption/copy
+  editedCaption      String? // human-edited version; null until first edit (provenance, Section 25)
+  cta                String?
+  visualDirection    String?
+  status             ContentAssetStatus @default(DRAFT)
+  approvedByUserId   String?            @db.Uuid
+  approvedAt         DateTime?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  workspace        Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workflowInstance WorkflowInstance @relation(fields: [workflowInstanceId], references: [id], onDelete: Cascade)
+  businessProfile  BusinessProfile? @relation(fields: [businessProfileId], references: [id], onDelete: SetNull)
+  approvedBy       User?            @relation(fields: [approvedByUserId], references: [id], onDelete: SetNull)
+
+  // Phase 20 Section 8.1: the real domain identity of a generated content
+  // piece is "the content for this workflow run, scheduled for day N, on
+  // platform P, of content type T" — NOT (workflowInstanceId, day) alone.
+  // calendarOutputSchema (marketing-autopilot.schemas.ts) deliberately
+  // allows 28-31 items with no day-uniqueness constraint, because a real
+  // content calendar can legitimately schedule more than one piece on the
+  // same day across different platforms (e.g. an Instagram carousel AND a
+  // WhatsApp status both on day 5) — collapsing that to (day) alone would
+  // silently drop a legitimate second item as a "duplicate". This
+  // constraint is what persist_assets' upsert (marketing-autopilot.steps.ts)
+  // keys on, making a retried persist_assets step safely re-runnable rather
+  // than creating a second set of rows.
+  @@unique([workflowInstanceId, day, platform, contentType])
+  @@index([workspaceId, status])
+  @@index([workflowInstanceId])
+  @@map("content_assets")
+}
+
+enum ContentAssetStatus {
+  DRAFT
+  IN_REVIEW
+  APPROVED
+  SCHEDULED
+  PUBLISHED
 }

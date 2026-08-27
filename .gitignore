@@ -26,6 +26,13 @@ pnpm-debug.log*
 coverage/
 .nyc_output/
 
+# Playwright
+/test-results/
+/e2e/report/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+
 # Editor / OS
 .vscode/*
 !.vscode/extensions.json
@@ -43,6 +50,14 @@ backend/prisma/*.db-journal
 backend/uploads/
 backend/tmp/
 
+# Database backup artifacts (Phase 31) — real customer data, never committed
+backend/backups/
+backend/tmp-test-backups/
+backend/tmp-test-backups-p32/
+
+# Customer data export artifacts (Phase 33) — real customer data, never committed
+backend/exports/
+
 # Vite
 frontend/.vite/
 *.local
@@ -51,3 +66,6 @@ frontend/.vite/
 *.pid
 *.seed
 *.pid.lock
+backups/
+
+/e2e/report-container/

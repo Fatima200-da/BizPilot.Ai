@@ -1,0 +1,75 @@
+# Phase 19: minimal SPA-serving config — client-side routing fallback to
+# index.html, sane caching for hashed assets, no server-side secrets (there
+# are none to leak — the frontend never holds any).
+#
+# Phase 23 Section 3/9: this is a `.template` file, not a plain `.conf` —
+# the official `nginx:1.27-alpine` image's entrypoint scripts automatically
+# run `envsubst` on every file in `/etc/nginx/templates/*.template` and
+# write the result to `/etc/nginx/conf.d/*.conf` before nginx starts (no
+# extra tooling/RUN step needed in the Dockerfile). This substitutes
+# ${BACKEND_UPSTREAM} with the real backend service address at container
+# start time, letting one built image serve any environment. Default value
+# (docker-compose service name) means the proxy still works if the env var
+# is left unset.
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Phase 23: a real curl test against the running container found these
+    # `add_header` directives, when placed at server level, get STACKED on
+    # top of the backend's own Helmet-set security headers for proxied
+    # `/api/` responses rather than overriding them — nginx's `add_header`
+    # adds unconditionally, it does not replace a same-named header already
+    # present in the upstream response. The result was two `X-Frame-Options`
+    # headers (`SAMEORIGIN` from Helmet, then `DENY` from here), two
+    # `Referrer-Policy` headers, two `X-XSS-Protection` headers — malformed,
+    # duplicate, conflicting response headers, confirmed via a direct `curl -v`
+    # against the real container. Moved into `location /` and
+    # `location /assets/` specifically (nginx's own static-file responses,
+    # which have no headers of their own to conflict with) so `location
+    # /api/` — which has no `add_header` of its own — never inherits them,
+    # and the backend's own Helmet headers pass through untouched.
+    location / {
+        add_header X-Frame-Options "DENY" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /assets/ {
+        add_header X-Frame-Options "DENY" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Phase 23 Section 3/9: optional same-origin API proxy. The frontend's
+    # own build (VITE_API_BASE_URL, baked in at build time — see
+    # frontend/Dockerfile) can call the backend directly instead; this
+    # block exists so a deployment can choose the same-origin path (no
+    # CORS needed, one public hostname) by pointing VITE_API_BASE_URL at
+    # `/api` instead of a separate backend origin.
+    location /api/ {
+        resolver 127.0.0.11 valid=10s; # Docker's embedded DNS — lets nginx
+                                          # start even if the backend isn't
+                                          # resolvable yet, and re-resolve on
+                                          # backend restart/redeploy.
+        set $backend_upstream "${BACKEND_UPSTREAM}";
+        proxy_pass http://$backend_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+}

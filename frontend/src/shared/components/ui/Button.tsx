@@ -67,10 +67,26 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
     },
     ref,
   ): JSX.Element => {
-    const Comp = asChild ? Slot : 'button';
+    // Radix's Slot requires exactly one React element child — it clones that
+    // child and merges props onto it rather than rendering a wrapper DOM
+    // node. It cannot accept sibling nodes (spinner/icons) alongside
+    // `children` the way a real `<button>` can, so `asChild` mode passes
+    // `children` through untouched. `isLoading`/icons are meaningless for a
+    // polymorphic element (e.g. a router `Link`) in this component's usage.
+    if (asChild) {
+      return (
+        <Slot
+          ref={ref}
+          className={cn(buttonVariants({ variant, size }), className)}
+          {...props}
+        >
+          {children}
+        </Slot>
+      );
+    }
 
     return (
-      <Comp
+      <button
         ref={ref}
         className={cn(buttonVariants({ variant, size }), className)}
         disabled={disabled ?? isLoading}
@@ -80,7 +96,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
         {isLoading ? <Spinner size={size === 'lg' ? 'lg' : 'sm'} label="" /> : leftIcon}
         {children}
         {!isLoading ? rightIcon : null}
-      </Comp>
+      </button>
     );
   },
 );

@@ -1,0 +1,28 @@
+# Minimum reproducible local PostgreSQL environment (Phase 16, Section 3).
+# Deliberately scoped to persistence only — no Redis/Kafka/object storage,
+# per this phase's explicit instruction not to add infrastructure that
+# future architecture documents merely mention but this phase does not need.
+name: bizpilot-ai
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: bizpilot-ai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: bizpilot_ai_dev
+    ports:
+      - '5432:5432'
+    volumes:
+      - bizpilot_ai_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d bizpilot_ai_dev']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  bizpilot_ai_postgres_data:
+    name: bizpilot_ai_postgres_data

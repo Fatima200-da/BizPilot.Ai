@@ -1,0 +1,202 @@
+name: CI
+
+# Phase 19 Section 23: install -> typecheck -> lint -> unit -> integration ->
+# build -> migration validation -> security audit -> E2E -> artifact ->
+# staging -> smoke -> production approval -> production.
+#
+# NOT YET RUNTIME-VERIFIED — no GitHub Actions runner was available to
+# execute this workflow in the environment this was authored in (no `gh`
+# CLI / Actions execution access). Every step reuses a command that WAS
+# actually run and verified locally this phase (see
+# docs/PHASE_19_PRODUCTION_OPERATIONS_AND_RELEASE.md's Evidence Appendix)
+# — this file is a structural transcription of real, working commands into
+# a real CI shape, not fabricated pipeline design. Treat "this workflow
+# runs green on GitHub" as unverified until it actually has.
+#
+# Production deployment is deliberately NOT automated from a branch push —
+# the `deploy-production` job requires a GitHub Environment with manual
+# reviewers configured (Settings > Environments > production > Required
+# reviewers), which is the explicit release gate this phase's brief
+# requires ("No automatic production deploy from an arbitrary branch").
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install-and-verify:
+    name: Install, typecheck, lint, unit test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.11'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run typecheck -w backend
+      - run: npm run typecheck -w frontend
+      - run: npm run lint -w backend
+      - run: npm run lint -w frontend
+      - run: npm test -w backend
+      - run: npm run build -w backend
+      - run: npm run build -w frontend
+      - run: npx prisma validate --schema=backend/prisma/schema.prisma
+      - name: Dependency audit (report only — see Phase 18/19 npm audit finding)
+        run: npm audit --audit-level=critical || true
+
+  integration-tests:
+    name: Integration tests (PGlite-native real-engine path)
+    runs-on: ubuntu-latest
+    needs: install-and-verify
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.11'
+          cache: 'npm'
+      - run: npm ci
+      # See docs/PHASE_17_PRODUCTION_VALIDATION_AND_MVP_RELEASE.md for why
+      # this path exists: a real Postgres *engine*, not yet a real Postgres
+      # *server* — DATABASE_URL is required by config/env.ts's schema but
+      # ignored by the PGlite adapter.
+      - run: npm run test:integration -w backend
+        env:
+          USE_PGLITE_ADAPTER: 'true'
+          DATABASE_URL: 'postgresql://unused:unused@localhost:5432/unused'
+          JWT_SECRET: 'ci-only-secret-do-not-use-in-production-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+          JWT_REFRESH_SECRET: 'ci-only-refresh-secret-do-not-use-in-production-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+
+  e2e-tests:
+    name: Playwright browser E2E
+    runs-on: ubuntu-latest
+    needs: install-and-verify
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.11'
+          cache: 'npm'
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: e2e/report/
+          retention-days: 14
+
+  docker-build:
+    name: Docker build + container smoke test
+    runs-on: ubuntu-latest
+    needs: install-and-verify
+    # Phase 23: GitHub Actions runners ship Docker natively, unlike the
+    # local environment this pipeline was authored in (which has no
+    # `docker` binary at all — see docs/PHASE_23_PRODUCTION_DEPLOYMENT_CERTIFICATION.md
+    # for exact evidence of that local gap). This job is expected to
+    # actually execute the first time this workflow runs on GitHub, even
+    # though it could not be executed locally while writing it.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: bizpilot_app
+          POSTGRES_PASSWORD: ci-only-password-not-a-real-secret
+          POSTGRES_DB: bizpilot_ai_ci
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U bizpilot_app -d bizpilot_ai_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image
+        run: docker build -f backend/Dockerfile -t bizpilot-backend:ci .
+      - name: Build frontend image
+        run: docker build -f frontend/Dockerfile -t bizpilot-frontend:ci --build-arg VITE_API_BASE_URL=/api/v1 .
+      - name: Run real migrations against the service-container Postgres
+        run: |
+          npm ci
+          DATABASE_URL="postgresql://bizpilot_app:ci-only-password-not-a-real-secret@localhost:5432/bizpilot_ai_ci?schema=public" \
+            npx prisma migrate deploy --schema=backend/prisma/schema.prisma
+      - name: Run backend container against real Postgres
+        run: |
+          docker run -d --name backend-ci --network host \
+            -e NODE_ENV=production \
+            -e DATABASE_URL="postgresql://bizpilot_app:ci-only-password-not-a-real-secret@localhost:5432/bizpilot_ai_ci?schema=public" \
+            -e USE_PGLITE_ADAPTER=false \
+            -e CORS_ORIGIN="http://localhost:5173" \
+            -e JWT_SECRET="ci-only-secret-do-not-use-in-production-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+            -e JWT_REFRESH_SECRET="ci-only-refresh-secret-do-not-use-in-production-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+            bizpilot-backend:ci
+      - name: Container smoke test — health, register, login
+        run: |
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:4000/health/live && break
+            sleep 2
+          done
+          curl -sf http://localhost:4000/health/ready | grep -q '"database":"reachable"'
+          curl -sf -X POST http://localhost:4000/api/v1/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"email":"ci-smoke@example.test","password":"password1234","fullName":"CI Smoke"}' \
+            | grep -q accessToken
+      - name: Container logs (always, for diagnosis)
+        if: always()
+        run: docker logs backend-ci
+
+  build-artifacts:
+    name: Build deployable artifacts
+    runs-on: ubuntu-latest
+    needs: [integration-tests, e2e-tests, docker-build]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.11'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build -w backend
+      - run: npm run build -w frontend
+      - name: Record release evidence
+        run: |
+          echo "commit=${{ github.sha }}" >> release-manifest.txt
+          echo "version=$(cat VERSION)" >> release-manifest.txt
+          echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> release-manifest.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: release-manifest.txt
+          retention-days: 90
+
+  deploy-staging:
+    name: Deploy to staging + smoke test
+    runs-on: ubuntu-latest
+    needs: build-artifacts
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy (BLOCKED — no staging infrastructure provisioned)
+        run: |
+          echo "No staging environment target is configured yet."
+          echo "See docs/PRODUCTION_RELEASE_RUNBOOK.md for the manual deployment procedure."
+          exit 1
+
+  deploy-production:
+    name: Deploy to production (manual approval required)
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment: production # configure required reviewers in repo Settings
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy (BLOCKED — no production infrastructure provisioned)
+        run: |
+          echo "No production environment target is configured yet."
+          echo "See docs/PRODUCTION_RELEASE_RUNBOOK.md for the manual deployment procedure."
+          exit 1

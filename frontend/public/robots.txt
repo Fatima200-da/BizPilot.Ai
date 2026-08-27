@@ -1,0 +1,7 @@
+# BizPilot AI is an authenticated SaaS application. Its only real,
+# unauthenticated public surfaces are the marketing shell, /login, and
+# /register — everything else requires a session and is meaningless to a
+# crawler regardless of robots directives (this file is not a security
+# control; real data protection is authentication, not robots.txt).
+User-agent: *
+Allow: /
